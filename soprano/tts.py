@@ -1,4 +1,3 @@
-from lmdeploy import pipeline, TurbomindEngineConfig, GenerationConfig
 from .vocos.decoder import SopranoDecoder
 import torch
 import re
@@ -10,20 +9,33 @@ import os
 
 class SopranoTTS:
     def __init__(self,
-            cache_size_mb=100,
-            decoder_batch_size=None):
-        cache_size_ratio = cache_size_mb * 1024**2 / torch.cuda.get_device_properties('cuda').total_memory
-        print(cache_size_ratio)
-        backend_config = TurbomindEngineConfig(cache_max_entry_count=cache_size_ratio)
-        self.pipeline = pipeline('ekwek/Soprano-80M', # get ckpt path
-            log_level='ERROR',
-            backend_config=backend_config)
+            backend='auto',
+            device='cuda',
+            cache_size_mb=10,
+            decoder_batch_size=1):
+        assert device in ['cuda', 'cpu'], f"unrecognized device {device}"
+        if backend == 'auto':
+            if device == 'cpu':
+                backend = 'transformers'
+            else:
+                try:
+                    import lmdeploy
+                    backend = 'lmdeploy'
+                except ImportError:
+                    backend='transformers'
+            print(f"Using backend {backend}.")
+        assert backend in ['lmdeploy', 'transformers'], f"unrecognized backend {backend}"
+
+        if backend == 'lmdeploy':
+            from .backends.lmdeploy import LMDeployModel
+            self.pipeline = LMDeployModel(device=device, cache_size_mb=cache_size_mb)
+        elif backend == 'transformers':
+            from .backends.transformers import TransformersModel
+            self.pipeline = TransformersModel(device=device)
         self.decoder = SopranoDecoder().cuda()
         decoder_path = hf_hub_download(repo_id='ekwek/Soprano-80M', filename='decoder.pth')
         self.decoder.load_state_dict(torch.load(decoder_path)) # get ckpt path
         self.decoder_batch_size=decoder_batch_size
-        if not decoder_batch_size:
-            self.decoder_batch_size = 32
         self.STREAM_CHUNK = 4 # Decoder receptive field, do not change
 
         self.infer("Hello world!") # warmup
@@ -76,18 +88,15 @@ class SopranoTTS:
         """
         sentence_data = self._preprocess_text(texts)
         prompts = list(map(lambda x: x[0], sentence_data))
-        gen_config=GenerationConfig(output_last_hidden_state='generation',
-                            do_sample=True,
-                            top_p=top_p,
-                            temperature=temperature,
-                            repetition_penalty=repetition_penalty,
-                            max_new_tokens=512)
-        responses = self.pipeline(prompts, gen_config=gen_config)
+        responses = self.pipeline.infer(prompts,
+            top_p=top_p,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty)
         hidden_states = []
         for i, response in enumerate(responses):
-            if response.finish_reason != 'stop':
+            if response['finish_reason'] != 'stop':
                 print(f"Warning: some sentences did not complete generation, likely due to hallucination.")
-            hidden_state = response.last_hidden_state
+            hidden_state = response['hidden_state']
             hidden_states.append(hidden_state)
         combined = list(zip(hidden_states, sentence_data))
         combined.sort(key=lambda x: -x[0].size(0))
@@ -128,21 +137,18 @@ class SopranoTTS:
             top_p=0.95,
             temperature=0.3,
             repetition_penalty=1.2):
-        gen_config=GenerationConfig(output_last_hidden_state='generation',
-                            do_sample=True,
-                            top_p=top_p,
-                            temperature=temperature,
-                            repetition_penalty=repetition_penalty,
-                            max_new_tokens=512)
         sentence_data = self._preprocess_text([text])
 
         for sentence, _, _ in sentence_data:
-            responses = self.pipeline.stream_infer([sentence], gen_config=gen_config)
+            responses = self.pipeline.stream_infer(sentence,
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty)
             hidden_states_buffer = []
             chunk_counter = chunk_size
             for token in responses:
-                finished = token.finish_reason is not None
-                if not finished: hidden_states_buffer.append(token.last_hidden_state[-1])
+                finished = token['finish_reason'] is not None
+                if not finished: hidden_states_buffer.append(token['hidden_state'][-1])
                 hidden_states_buffer = hidden_states_buffer[-(2*self.STREAM_CHUNK+chunk_size):]
                 if finished or len(hidden_states_buffer) >= self.STREAM_CHUNK + chunk_size:
                     if finished or chunk_counter == chunk_size:
